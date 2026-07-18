@@ -202,24 +202,11 @@ reviewiq/
         └── App.jsx                # Complete single-file app
 ```
 
----
-
-## If We Had More Time
-
-1. **Email/SMS alerts** — send push notifications when the same issue appears in 3+ reviews in a week (Twilio + SendGrid integration is ~2 hours of work)
-
-2. **Predictive modeling** — train a simple regression model on review trends to project future ratings if issues are/aren't addressed
-
-3. **Monthly growth page** — month-over-month comparison with percentage deltas and a "this month's story" narrative AI summary
 
 ---
 
 ## Team
 
-Built at Blueprint Hackathon 2025 by a team of 4.
+Built by Blueprint Hackathon 2026 by a team of 3.
 
 ---
-
-## License
-
-MIT — feel free to build on this.
