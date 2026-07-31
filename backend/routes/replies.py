@@ -6,7 +6,7 @@ router = APIRouter()
 
 class ReplyRequest(BaseModel):
     review_text: str
-    rating: int
+    rating: float  # accept int or float; SerpAPI can return either
     business_name: str
     personality: str = 'professional'
 

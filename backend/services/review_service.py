@@ -1,167 +1,221 @@
 """
-Review fetching service.
-Priority: Google Places API → SerpApi → Demo data (never fail on stage).
+Review fetching service — SerpApi Google Maps only.
+Raises on any failure so the caller can surface a real error to the user.
 """
 
 import os
+import re
 import httpx
-import asyncio
-from typing import Optional
-from services.demo_data import get_demo_business, MONTHLY_TREND_TEMPLATE
+from datetime import datetime, timedelta
+from services.cache import TTLCache, make_key
+from services import serp_keys
 import logging
+
+_MONTH_RE = re.compile(r'^\d{4}-\d{2}$')
+
+
+def _parse_serpapi_date(date_str: str) -> str:
+    """
+    Convert SerpAPI's date field to YYYY-MM.
+
+    SerpAPI google_maps_reviews returns relative strings like:
+      "a month ago", "3 months ago", "a year ago", "2 weeks ago"
+    It sometimes also returns absolute ISO strings like "2024-01-15".
+    We handle both.
+    """
+    if not date_str:
+        return ""
+
+    s = date_str.strip()
+
+    # Already an absolute ISO date (YYYY-MM-DD or YYYY-MM)
+    if len(s) >= 7 and s[4:5] == "-":
+        return s[:7]
+
+    # Strip prefixes like "Edited ", "Updated ", etc.
+    s = s.lower()
+    for prefix in ("edited ", "updated ", "reviewed "):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    now = datetime.now()
+    try:
+        if "year" in s:
+            n = 1 if s.startswith(("a ", "an ")) else int(s.split()[0])
+            return f"{now.year - n:04d}-{now.month:02d}"
+        elif "month" in s:
+            n = 1 if s.startswith(("a ", "an ")) else int(s.split()[0])
+            total = now.year * 12 + now.month - n - 1
+            return f"{total // 12:04d}-{total % 12 + 1:02d}"
+        elif "week" in s:
+            n = 1 if s.startswith(("a ", "an ")) else int(s.split()[0])
+            d = now - timedelta(weeks=n)
+            return d.strftime("%Y-%m")
+        elif "day" in s:
+            n = 1 if s.startswith(("a ", "an ")) else int(s.split()[0])
+            d = now - timedelta(days=n)
+            return d.strftime("%Y-%m")
+    except Exception:
+        pass
+    return ""
 
 logger = logging.getLogger(__name__)
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
-SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
+# Keys are managed by serp_keys pool — no single SERPAPI_KEY variable needed here
+
+_search_cache = TTLCache(ttl_seconds=1800)  # 30 min
 
 
 async def search_business(query: str) -> dict:
-    """Search for a business. Returns normalized business data."""
+    """Search for a business via SerpApi. Raises on any failure."""
 
-    # Only hit external APIs if keys are actually configured — skip immediately if not
-    if GOOGLE_API_KEY:
-        try:
-            result = await _google_places_search(query)
-            if result:
-                return result
-        except Exception as e:
-            logger.warning(f"Google Places failed: {e}")
+    cache_key = make_key("search_business", query.strip().lower())
+    cached = _search_cache.get(cache_key)
+    if cached is not None:
+        logger.info(f"Cache hit: search_business('{query}')")
+        return cached
 
-    if SERPAPI_KEY:
-        try:
-            result = await _serpapi_search(query)
-            if result:
-                return result
-        except Exception as e:
-            logger.warning(f"SerpApi failed: {e}")
+    try:
+        result = await _serpapi_search(query)
+    except Exception as e:
+        logger.error(f"SerpApi search failed for '{query}': {e}")
+        raise
 
-    # No keys or all failed — return a shell instantly with the searched name
-    logger.info(f"No API keys configured, returning shell for: {query}")
-    return {
-        "name": query.title(),
-        "address": "",
-        "rating": None,
-        "total_reviews": 0,
-        "category": "Business",
-        "phone": "",
-        "website": "",
-        "reviews": [],
-        "monthly_trends": {},
-    }
+    _search_cache.set(cache_key, result)
+    return result
 
 
-async def _google_places_search(query: str) -> Optional[dict]:
-    """Fetch from Google Places API."""
-    async with httpx.AsyncClient(timeout=1.0) as client:
-        # Find place
-        find_resp = await client.get(
-            "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
-            params={
-                "input": query,
-                "inputtype": "textquery",
-                "fields": "place_id,name,formatted_address,rating,user_ratings_total,geometry",
-                "key": GOOGLE_API_KEY,
-            }
-        )
-        find_data = find_resp.json()
-        
-        if not find_data.get("candidates"):
-            return None
-        
-        place = find_data["candidates"][0]
-        place_id = place["place_id"]
-        
-        # Get details + reviews
-        detail_resp = await client.get(
-            "https://maps.googleapis.com/maps/api/place/details/json",
-            params={
-                "place_id": place_id,
-                "fields": "name,rating,formatted_address,formatted_phone_number,website,opening_hours,price_level,reviews,user_ratings_total,types",
-                "key": GOOGLE_API_KEY,
-            }
-        )
-        detail_data = detail_resp.json().get("result", {})
-        
-        reviews = []
-        for i, r in enumerate(detail_data.get("reviews", [])):
-            reviews.append({
-                "id": f"g_{i}",
-                "author": r.get("author_name", "Anonymous"),
-                "rating": r.get("rating", 3),
-                "date": _timestamp_to_date(r.get("time", 0)),
-                "text": r.get("text", ""),
-                "month": _timestamp_to_month(r.get("time", 0)),
-            })
-        
-        return {
-            "place_id": place_id,
-            "name": detail_data.get("name", query),
-            "address": detail_data.get("formatted_address", ""),
-            "rating": detail_data.get("rating", 0),
-            "total_reviews": detail_data.get("user_ratings_total", 0),
-            "phone": detail_data.get("formatted_phone_number", ""),
-            "website": detail_data.get("website", ""),
-            "category": _extract_category(detail_data.get("types", [])),
-            "price_level": detail_data.get("price_level", 2),
-            "reviews": reviews,
-        }
+async def _serpapi_get(client: httpx.AsyncClient, params: dict) -> dict:
+    """Make a single SerpAPI request with key-rotation on 429."""
+    key = serp_keys.get_key()
+    params = {**params, "api_key": key}
+    resp = await client.get("https://serpapi.com/search", params=params)
+    if resp.status_code == 429:
+        serp_keys.mark_rate_limited(key)
+        # Retry once with the next key
+        key = serp_keys.get_key()
+        params["api_key"] = key
+        resp = await client.get("https://serpapi.com/search", params=params)
+    if resp.status_code != 200:
+        raise RuntimeError(f"SerpApi returned HTTP {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    if "error" in data:
+        raise RuntimeError(f"SerpApi error: {data['error']}")
+    return data
 
 
-async def _serpapi_search(query: str) -> Optional[dict]:
-    """Fallback: SerpApi Google Maps results."""
-    async with httpx.AsyncClient(timeout=1.0) as client:
-        resp = await client.get(
-            "https://serpapi.com/search",
-            params={
-                "engine": "google_maps",
-                "q": query,
-                "api_key": SERPAPI_KEY,
-                "type": "search",
-            }
-        )
-        data = resp.json()
-        
+async def _serpapi_search(query: str) -> dict:
+    """Fetch business info + reviews from SerpApi Google Maps."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        data = await _serpapi_get(client, {
+            "engine": "google_maps",
+            "q": query,
+            "type": "search",
+        })
+
         results = data.get("local_results", [])
+        if not results and "place_results" in data:
+            results = [data["place_results"]]
+
         if not results:
-            return None
-        
+            raise ValueError(f"No business found on Google Maps for: '{query}'")
+
         place = results[0]
-        
-        # Fetch reviews separately
+        data_id = place.get("data_id", "")
+
+        # Fetch reviews with pagination — SerpAPI returns 10/page.
+        # We follow next_page_token up to MAX_PAGES to avoid runaway quota spend.
+        MAX_REVIEW_PAGES = 50   # 50 pages × 10 reviews = up to 500 reviews
         reviews = []
-        place_id = place.get("place_id", "")
-        if place_id:
-            rev_resp = await client.get(
-                "https://serpapi.com/search",
-                params={
+        next_token = None
+        page = 0
+
+        if data_id:
+            while page < MAX_REVIEW_PAGES:
+                rev_params = {
                     "engine": "google_maps_reviews",
-                    "place_id": place_id,
-                    "api_key": SERPAPI_KEY,
-                    "num": "20",
+                    "data_id": data_id,
+                    "sort_by": "newestFirst",
                 }
-            )
-            rev_data = rev_resp.json()
-            for i, r in enumerate(rev_data.get("reviews", [])):
-                reviews.append({
-                    "id": f"s_{i}",
-                    "author": r.get("user", {}).get("name", "Anonymous"),
-                    "rating": r.get("rating", 3),
-                    "date": r.get("date", ""),
-                    "text": r.get("snippet", ""),
-                    "month": r.get("date", "")[:7] if r.get("date") else "",
-                })
-        
+                if next_token:
+                    rev_params["next_page_token"] = next_token
+
+                rev_data = await _serpapi_get(client, rev_params)
+
+                page_reviews = rev_data.get("reviews", [])
+                if not page_reviews:
+                    break   # no more reviews
+
+                offset = len(reviews)
+                for i, r in enumerate(page_reviews):
+                    date = r.get("date") or ""
+                    month = _parse_serpapi_date(date)
+                    reviews.append({
+                        "id": f"s_{offset + i}",
+                        "author": r.get("user", {}).get("name") or "Anonymous",
+                        "rating": int(r.get("rating") or 3),
+                        "date": date,
+                        "text": r.get("snippet") or "",
+                        "month": month,
+                    })
+
+                next_token = rev_data.get("serpapi_pagination", {}).get("next_page_token")
+                if not next_token:
+                    break   # last page
+
+                page += 1
+
+        logger.info(f"Fetched {len(reviews)} reviews across {page + 1} page(s) for '{query}'")
+
+        # ── Capped supplementation ────────────────────────────────────────────
+        total_reviews = place.get("reviews") or 0
+        is_capped = total_reviews > len(reviews) and len(reviews) > 0
+
+        if is_capped and data_id:
+            seen = {(r["author"], r["date"]) for r in reviews}
+            before_supp = len(reviews)
+            for sort_order in ("ratingLow", "ratingHigh", "mostRelevant"):
+                try:
+                    supp_data = await _serpapi_get(client, {
+                        "engine": "google_maps_reviews",
+                        "data_id": data_id,
+                        "sort_by": sort_order,
+                    })
+                    offset = len(reviews)
+                    for i, r in enumerate(supp_data.get("reviews", [])):
+                        author = r.get("user", {}).get("name") or "Anonymous"
+                        date   = r.get("date") or ""
+                        dedup_key = (author, date)
+                        if dedup_key in seen:
+                            continue
+                        seen.add(dedup_key)
+                        month = _parse_serpapi_date(date)
+                        reviews.append({
+                            "id": f"s_{sort_order}_{i}",
+                            "author": author,
+                            "rating": int(r.get("rating") or 3),
+                            "date": date,
+                            "text": r.get("snippet") or "",
+                            "month": month,
+                            "supplemental": True,
+                        })
+                    logger.info(f"[{sort_order}] added {len(reviews) - offset} supplemental reviews for '{query}'")
+                except Exception as e:
+                    logger.warning(f"Supplemental fetch ({sort_order}) failed for '{query}': {e}")
+            logger.info(f"Total supplemental reviews added: {len(reviews) - before_supp}")
+
+        # Use `or` fallbacks — SerpAPI can return a key with value None,
+        # in which case dict.get("key", default) still returns None.
         return {
-            "place_id": place_id,
-            "name": place.get("title", query),
-            "address": place.get("address", ""),
-            "rating": place.get("rating", 0),
-            "total_reviews": place.get("reviews", 0),
-            "phone": place.get("phone", ""),
-            "website": place.get("website", ""),
-            "category": place.get("type", "Business"),
-            "price_level": len(place.get("price", "")),
+            "place_id": place.get("place_id") or "",
+            "name": place.get("title") or query,
+            "address": place.get("address") or "",
+            "rating": place.get("rating") or 0,
+            "total_reviews": place.get("reviews") or 0,
+            "phone": place.get("phone") or "",
+            "website": place.get("website") or "",
+            "category": (_t[0] if isinstance(_t := place.get("type"), list) else _t) or "Business",
+            "price_level": len(place.get("price") or ""),
             "reviews": reviews,
         }
 
@@ -169,65 +223,21 @@ async def _serpapi_search(query: str) -> Optional[dict]:
 def compute_monthly_trends(reviews: list) -> dict:
     """Aggregate reviews by month for trend graphs."""
     from collections import defaultdict
-    
-    monthly = defaultdict(lambda: {"total_rating": 0, "count": 0, "texts": []})
-    
+
+    monthly = defaultdict(lambda: {"total_rating": 0, "count": 0})
+
     for review in reviews:
         month = review.get("month", "")
-        if month and len(month) == 7:
+        if month and _MONTH_RE.match(month):   # must be exactly YYYY-MM
             monthly[month]["total_rating"] += review.get("rating", 3)
             monthly[month]["count"] += 1
-            monthly[month]["texts"].append(review.get("text", ""))
-    
-    # If we have real data, use it; otherwise fall back to template
-    if monthly:
-        result = {}
-        for month, data in sorted(monthly.items()):
-            count = data["count"]
-            result[month] = {
-                "avg_rating": round(data["total_rating"] / count, 2),
-                "review_count": count,
-                "sentiment": round(min(max(data["total_rating"] / count / 5, 0), 1), 2),
-            }
-        return result
-    
-    return MONTHLY_TREND_TEMPLATE
 
-
-def _timestamp_to_date(ts: int) -> str:
-    from datetime import datetime
-    if not ts:
-        return ""
-    try:
-        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
-    except:
-        return ""
-
-
-def _timestamp_to_month(ts: int) -> str:
-    from datetime import datetime
-    if not ts:
-        return ""
-    try:
-        return datetime.fromtimestamp(ts).strftime("%Y-%m")
-    except:
-        return ""
-
-
-def _extract_category(types: list) -> str:
-    type_map = {
-        "restaurant": "Restaurant",
-        "food": "Restaurant",
-        "cafe": "Cafe",
-        "bar": "Bar",
-        "spa": "Spa & Wellness",
-        "gym": "Fitness",
-        "hotel": "Hotel",
-        "store": "Retail",
-        "health": "Healthcare",
-        "beauty_salon": "Salon",
-    }
-    for t in types:
-        if t in type_map:
-            return type_map[t]
-    return types[0].replace("_", " ").title() if types else "Business"
+    result = {}
+    for month, data in sorted(monthly.items()):
+        count = data["count"]
+        result[month] = {
+            "avg_rating": round(data["total_rating"] / count, 2),
+            "review_count": count,
+            "sentiment": round(min(max(data["total_rating"] / count / 5, 0), 1), 2),
+        }
+    return result

@@ -1,12 +1,34 @@
 from fastapi import APIRouter, HTTPException, Query
-from services.demo_data import get_demo_competitors
+from services.competitor_service import find_competitors
 
 router = APIRouter()
 
 @router.get('/compare')
-async def compare_competitors(business: str = Query(...)):
+async def compare_competitors(
+    business: str = Query(...),
+    address: str = Query(...)):
+    print("COMPETITOR QUERY RECEIVED:", business)
+    print("COMPETITOR ROUTE HIT:", business)
+
     try:
-        competitors = get_demo_competitors(business)
-        return {'success': True, 'data': {'competitors': competitors, 'business_name': business}}
+        competitors = await find_competitors(f"{business} {address}")
+
+        print("RETURNING:", competitors)
+
+        return {
+            'success': True,
+            'data': {
+                'competitors': competitors,
+                'business_name': business
+            }
+        }
+
+    except ValueError as e:
+        print("COMPETITOR NOT FOUND:", e)
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        print("COMPETITOR API ERROR:", e)
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print("COMPETITOR UNEXPECTED ERROR:", e)
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")

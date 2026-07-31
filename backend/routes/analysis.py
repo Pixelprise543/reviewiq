@@ -1,12 +1,13 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from typing import Any, List
 from services.ai_service import analyze_reviews, generate_weekly_report
 
 router = APIRouter()
 
 class AnalyzeRequest(BaseModel):
     business_name: str
-    reviews: list
+    reviews: List[Any]   # bare `list` can behave unexpectedly in some Pydantic v2 builds
     category: str = 'Business'
 
 class ReportRequest(BaseModel):
@@ -16,6 +17,7 @@ class ReportRequest(BaseModel):
 
 @router.post('/analyze')
 async def analyze(req: AnalyzeRequest):
+    print(f"[analyze] business={req.business_name!r} category={req.category!r} reviews={len(req.reviews)}")
     try:
         result = await analyze_reviews(req.business_name, req.reviews, req.category)
         return {'success': True, 'data': result}

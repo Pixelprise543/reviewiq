@@ -24,28 +24,26 @@ Enter any business name → ReviewIQ pulls their Google reviews, runs AI analysi
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────┐
 │                    Frontend (React)                  │
 │  Vite + Recharts + Tailwind-style inline CSS         │
 │  Search → Dashboard → Tabs (Overview/Issues/         │
 │           Trends/Competitors/Replies/Reports)        │
-└───────────────────────┬─────────────────────────────┘
+└───────────────────────┬──────────────────────────────┘
                         │ HTTP / REST
-┌───────────────────────▼─────────────────────────────┐
-│                   Backend (FastAPI)                  │
-│                                                      │
-│  /api/reviews/search  →  Google Places API           │
-│                           └→ SerpApi (fallback)      │
-│                               └→ Demo data (always)  │
-│                                                      │
-│  /api/analysis/analyze →  Claude claude-sonnet-4-6  │
-│  /api/replies/generate →  Claude claude-sonnet-4-6  │
-│  /api/analysis/report  →  Claude claude-sonnet-4-6  │
-│  /api/competitors/compare → Demo/cached data         │
-└─────────────────────────────────────────────────────┘
+┌───────────────────────▼──────────────────────────────────┐
+│                   Backend (FastAPI)                      │
+│                                                          │
+│  /api/reviews/search  →  SerpApi                         |
+│                                                          │
+│                                                          │
+│  /api/analysis/analyze →  Groq (llama-3.3-70b-versatile) │
+│  /api/replies/generate →  Groq (llama-3.3-70b-versatile) │
+│  /api/analysis/report  →  Groq (llama-3.3-70b-versatile) │
+│  /api/competitors/compare → Demo/cached data             │
+└──────────────────────────────────────────────────────────┘
 ```
 
-**Three-tier fallback** on every data source: live API → secondary API → demo data. Nothing can break on stage.
 
 ---
 
@@ -85,12 +83,20 @@ Then open **http://localhost:3000** and search for "The Golden Fork" to see the 
 ## Environment Variables
 
 ```env
-ANTHROPIC_API_KEY=       # Required for AI analysis and replies
-GOOGLE_PLACES_API_KEY=   # Optional: enables live business search
-SERPAPI_KEY=             # Optional: richer review data (20+ reviews)
+
+GROQ_API_KEY=
+# for fallback
+SERPAPI_KEY=
+SERPAPI_KEY_1=
+SERPAPI_KEY_2=
+SERPAPI_KEY_3=
+SERPAPI_KEY_4=
+SERPAPI_KEY_5=
 ```
 
-The app runs in **demo mode** with no keys — all features work with pre-seeded data.
+The app runs in **demo mode** with no keys — searching "The Golden Fork" or "Urban Wellness Spa"
+serves pre-seeded businesses, reviews, and competitors with zero external calls (see
+`backend/services/demo_data.py`). AI analysis, replies, and reports still require `GROQ_API_KEY`.
 
 ---
 
@@ -134,7 +140,7 @@ All endpoints return `{"success": true, "data": {...}}` or `{"success": false, "
 ## Feature Deep Dive
 
 ### Issue Prioritization
-Claude analyzes all reviews and ranks issues by:
+Groq's Llama 3.3 70B analyzes all reviews and ranks issues by:
 1. **Frequency** — how many reviews mention it
 2. **Severity** — critical / high / medium / low
 3. **Category** — service, food, ambiance, wait time, cleanliness, etc.
@@ -170,7 +176,7 @@ Triggered when the same issue (keyword cluster) appears in 3+ reviews within a s
 | Frontend | React 18 + Vite | Fast, familiar, great DX |
 | Charts | Recharts | Best React charting library, zero config |
 | Backend | FastAPI (Python) | Async, auto-docs, fast to write |
-| AI | Claude claude-sonnet-4-6 | Best instruction-following for structured JSON |
+| AI | Groq (Llama 3.3 70B Versatile) | Fast, low-cost inference with reliable structured JSON output |
 | Reviews | Google Places API + SerpApi | Two-source redundancy |
 | Deploy | Vercel + Railway | One-click, free tier, zero DevOps |
 
@@ -191,7 +197,7 @@ reviewiq/
 │   │   └── competitors.py         # Competitor comparison
 │   └── services/
 │       ├── review_service.py      # Google Places + SerpApi + fallback
-│       ├── ai_service.py          # Claude integration + fallback logic
+│       ├── ai_service.py          # Groq integration + fallback logic
 │       └── demo_data.py           # Always-available seed data
 └── frontend/
     ├── index.html

@@ -8,16 +8,39 @@ import os
 import json
 import logging
 from typing import Optional
-from groq import Groq
+from groq import AsyncGroq
+
+from services.cache import TTLCache, make_key
 
 logger = logging.getLogger(__name__)
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY", ""))
+client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY", ""))
+
+# Caches are keyed off the actual request contents (not just business name),
+# so a genuinely different set of reviews never returns stale output — only
+# identical requests hit the cache instead of Groq.
+_analysis_cache = TTLCache(ttl_seconds=3600)   # analyses don't need to be fresher than hourly
+_reply_cache = TTLCache(ttl_seconds=3600)      # same review+personality -> same reply is fine
+# Note: no cache for weekly reports — see generate_weekly_report() below.
+
+# Most Google reviews are well under this; only the rare long rant gets
+# trimmed. Issue extraction, sentiment, and keywords all come through
+# clearly in the first few sentences, so this cuts input tokens on
+# long-tail reviews without changing what the analysis surfaces.
+MAX_REVIEW_CHARS = 600
+
+
+def _truncate_review_text(text: str, max_chars: int = MAX_REVIEW_CHARS) -> str:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    # Cut on a word boundary so we don't hand the model a chopped-off word.
+    return text[:max_chars].rsplit(" ", 1)[0] + "…"
 
 
 async def analyze_reviews(business_name: str, reviews: list, category: str = "Business") -> dict:
     """
-    Main analysis: send all reviews to Claude, get structured JSON back.
+    Main analysis: send all reviews to Groq, get structured JSON back.
     Returns issues, keywords, sentiment, solutions, and priority ranking.
     """
     if not reviews:
@@ -25,8 +48,23 @@ async def analyze_reviews(business_name: str, reviews: list, category: str = "Bu
 
     # Prepare review text — cap at 30 reviews to keep tokens reasonable
     review_sample = reviews[:30]
+
+    # Cache key is derived from the exact review content being analyzed, so
+    # re-searching the same business (a demo re-run, a judge testing twice)
+    # returns the cached result instead of paying for another Groq call.
+    cache_key = make_key(
+        "analyze",
+        business_name,
+        category,
+        [(r.get("id"), r.get("rating"), r.get("text")) for r in review_sample],
+    )
+    cached = _analysis_cache.get(cache_key)
+    if cached is not None:
+        logger.info(f"Cache hit: analyze_reviews('{business_name}')")
+        return cached
+
     reviews_text = "\n\n".join([
-        f"[Rating: {r['rating']}/5 | {r.get('date', '')}]\n{r['text']}"
+        f"[Rating: {r['rating']}/5 | {r.get('date', '')}]\n{_truncate_review_text(r['text'])}"
         for r in review_sample
         if r.get("text")
     ])
@@ -88,7 +126,7 @@ Rules:
 - Return ONLY the JSON. No preamble, no explanation."""
 
     try:
-        completion = client.chat.completions.create(
+        completion = await client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
@@ -96,6 +134,7 @@ Rules:
         )
         raw = completion.choices[0].message.content.strip()
         result = json.loads(raw)
+        _analysis_cache.set(cache_key, result)
         return result
 
     except json.JSONDecodeError as e:
@@ -119,7 +158,15 @@ async def generate_reply(review_text: str, rating: int, business_name: str, pers
     
     tone = personality_guides.get(personality, personality_guides["professional"])
     sentiment = "negative" if rating <= 2 else "positive" if rating >= 4 else "mixed"
-    
+
+    # Same review + same personality = same reply, so cache it — users often
+    # flip between personalities and back to compare.
+    cache_key = make_key("reply", review_text, rating, business_name, personality)
+    cached = _reply_cache.get(cache_key)
+    if cached is not None:
+        logger.info(f"Cache hit: generate_reply('{business_name}', {personality})")
+        return cached
+
     prompt = f"""Write a {sentiment} review response for {business_name}.
 
 Review (Rating: {rating}/5): "{review_text}"
@@ -135,12 +182,14 @@ Rules:
 - Return ONLY the reply text, nothing else"""
 
     try:
-        completion = client.chat.completions.create(
+        completion = await client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             max_tokens=300,
             messages=[{"role": "user", "content": prompt}],
         )
-        return completion.choices[0].message.content.strip()
+        reply = completion.choices[0].message.content.strip()
+        _reply_cache.set(cache_key, reply)
+        return reply
     except Exception as e:
         logger.error(f"Reply generation failed: {e}")
         return _fallback_reply(sentiment, business_name)
@@ -151,7 +200,11 @@ async def generate_weekly_report(business_name: str, analysis: dict, trends: dic
     
     top_issues = analysis.get("issues", [])[:3]
     issues_text = "\n".join([f"- {i['title']} (priority #{i['priority_rank']})" for i in top_issues])
-    
+
+    # Not cached: the frontend has an explicit "Regenerate" button for this
+    # report, so callers expect a fresh take each time — caching by input
+    # would make Regenerate silently return identical text.
+
     prompt = f"""Write a concise weekly business insight report for {business_name}.
 
 Current overall sentiment: {analysis.get('overall_sentiment', 0.5):.0%}
@@ -168,7 +221,7 @@ Write a professional 3-paragraph weekly report:
 Return only the report text."""
 
     try:
-        completion = client.chat.completions.create(
+        completion = await client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             max_tokens=400,
             messages=[{"role": "user", "content": prompt}],
